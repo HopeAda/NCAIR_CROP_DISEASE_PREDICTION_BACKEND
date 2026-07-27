@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+llama-cpp-python
+python-docx
+pydantic
+ultralytics
+pillow
+python-multipart
