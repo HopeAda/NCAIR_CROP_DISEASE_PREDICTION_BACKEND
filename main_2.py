@@ -174,7 +174,7 @@ class DetectionRequest(BaseModel):
 
 # --- load detection model ONCE at startup, alongside the LLM ---
 DETECTION_MODEL = YOLO("best.pt")
-CONFIDENCE_THRESHOLD = 0.5  # tune this based on your model's real-world behavior
+CONFIDENCE_THRESHOLD = 0.6  # tune this based on your model's real-world behavior
 
 def predict_disease(image_bytes: bytes):
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")

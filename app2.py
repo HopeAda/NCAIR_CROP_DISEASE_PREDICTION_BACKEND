@@ -4,6 +4,9 @@ import json
 import re
 import glob
 import base64
+import uuid
+import threading
+import time
 
 import cv2
 import docx
@@ -26,7 +29,9 @@ app.add_middleware(
 SUPPORTED_LANGUAGES = ("English", "Hausa")
 
 
-
+# ---------------------------------------------------------------------------
+# Model + knowledge base loading (runs once at startup)
+# ---------------------------------------------------------------------------
 
 llm = Llama(
     model_path=r"C:\Users\user\Desktop\crop-predict\backend\N-ATLaS.Q4_K_M.gguf",  # adjust to your actual file path
@@ -36,10 +41,32 @@ llm = Llama(
     verbose=False,
 )
 
-DETECTION_MODEL = YOLO(r"C:\Users\user\Desktop\crop-predict\backend\model.pt")
+DETECTION_MODEL = YOLO(r"C:\Users\user\Desktop\crop-predict\backend\best.pt")
 CONFIDENCE_THRESHOLD = 0.5  # tune based on real-world behavior
 
 DOCS_FOLDER = r"C:\Users\user\Desktop\crop-predict\backend\CROP_DISEASES"
+CACHE_PATH = r"C:\Users\user\Desktop\crop-predict\recommendation_cache.json"
+
+# --- Concurrency guards: the loaded model objects are shared across
+# request threads once we run jobs in the background. ---
+YOLO_LOCK = threading.Lock()
+LLM_LOCK = threading.Lock()
+
+# --- Job store for fire-and-poll ---
+JOBS: dict[str, dict] = {}
+JOBS_LOCK = threading.Lock()
+JOB_TTL_SECONDS = 60 * 30  # prune finished jobs after 30 min so JOBS doesn't grow forever
+
+
+def _prune_old_jobs():
+    cutoff = time.time() - JOB_TTL_SECONDS
+    with JOBS_LOCK:
+        stale = [
+            jid for jid, job in JOBS.items()
+            if job.get("status") in ("done", "error") and job.get("created_at", 0) < cutoff
+        ]
+        for jid in stale:
+            del JOBS[jid]
 
 
 def load_kb_from_documents(folder):
@@ -61,7 +88,6 @@ print(f"Loaded {len(TREATMENT_KB)} knowledge base entries: {list(TREATMENT_KB.ke
 
 # Pre-generated cache — see generate_cache.py. Loaded if present; safe to run without it.
 RECOMMENDATION_CACHE = {}
-CACHE_PATH = r"C:\Users\user\Desktop\crop-predict\recommendation_cache.json"
 if os.path.exists(CACHE_PATH):
     with open(CACHE_PATH, "r", encoding="utf-8") as f:
         RECOMMENDATION_CACHE = json.load(f)
@@ -70,7 +96,9 @@ else:
     print("No recommendation cache found — will generate live for every request.")
 
 
-
+# ---------------------------------------------------------------------------
+# Knowledge base lookup
+# ---------------------------------------------------------------------------
 
 def retrieve_facts(crop, disease):
     return TREATMENT_KB.get((crop, disease)) or (
@@ -85,7 +113,9 @@ def split_crop_disease(class_name: str):
     return crop, disease
 
 
-
+# ---------------------------------------------------------------------------
+# Prompt construction — Step 1: generate the base answer in English only
+# ---------------------------------------------------------------------------
 
 def build_prompt(crop, disease, confidence, facts, status, language="English"):
     system_message = (
@@ -127,7 +157,9 @@ Write it in {language}. Respond with ONLY the JSON object above filled in — no
     ]
 
 
-
+# ---------------------------------------------------------------------------
+# Prompt construction — Step 2: translate the finished English answer
+# ---------------------------------------------------------------------------
 
 def build_translation_prompt(crop, disease, description, cause, steps, more_about, prevention, target_language):
     """
@@ -186,7 +218,9 @@ Return ONLY this JSON, fully translated into {target_language}:
     ]
 
 
-
+# ---------------------------------------------------------------------------
+# LLM call with retry + validation
+# ---------------------------------------------------------------------------
 
 def call_llm(messages, max_new_tokens=900, retries=2, json_mode=False):
     """
@@ -200,9 +234,10 @@ def call_llm(messages, max_new_tokens=900, retries=2, json_mode=False):
 
     for attempt in range(1, retries + 2):
         try:
-            output = llm.create_chat_completion(
-                messages=messages, max_tokens=max_new_tokens, **kwargs,
-            )
+            with LLM_LOCK:
+                output = llm.create_chat_completion(
+                    messages=messages, max_tokens=max_new_tokens, **kwargs,
+                )
             content = output["choices"][0]["message"]["content"].strip()
             if content:
                 return content
@@ -263,14 +298,15 @@ def _parse_json_or_none(text: str):
     return None
 
 
+# ---------------------------------------------------------------------------
+# Live generation — English first, then translate
+# ---------------------------------------------------------------------------
 
-
-def generate_bilingual_recommendation(crop, disease, confidence, status):
-    """Always generates live — no cache check. Used by generate_cache.py and
-    as the fallback inside get_recommendation() below."""
+def _generate_live_recommendation(crop, disease, confidence, status):
+    """Always generates fresh — no cache check. Used directly, and as the
+    fallback inside get_recommendation() when a class isn't pre-cached."""
     facts = retrieve_facts(crop, disease)
 
-    # Step 1: generate the base answer in English
     english_messages = build_prompt(crop, disease, confidence, facts, status, language="English")
     english_raw = call_llm(english_messages, json_mode=True)
     english_parsed = _parse_llm_json(english_raw, status)
@@ -278,7 +314,6 @@ def generate_bilingual_recommendation(crop, disease, confidence, status):
 
     recommendations = {"English": english_parsed}
 
-    # Step 2: translate the English answer into every other supported language
     for language in SUPPORTED_LANGUAGES:
         if language == "English":
             continue
@@ -313,20 +348,27 @@ def generate_bilingual_recommendation(crop, disease, confidence, status):
 
 
 def get_recommendation(crop, disease, confidence, status):
-    """Cache-first lookup; falls back to live bilingual generation for unseen classes."""
+    """Cache-first: fast, deterministic lookup for known classes. Falls back
+    to live generation for anything not pre-cached. The 'source' field makes
+    this visible to the frontend/reviewer rather than hidden."""
     cache_key = f"{crop}_{disease}"
     cached = RECOMMENDATION_CACHE.get(cache_key)
+
     if cached is not None:
-        return cached
+        return {**cached, "source": "cache"}
 
-    return generate_bilingual_recommendation(crop, disease, confidence, status)
+    live_result = _generate_live_recommendation(crop, disease, confidence, status)
+    return {**live_result, "source": "live"}
 
 
-
+# ---------------------------------------------------------------------------
+# Image prediction (YOLO)
+# ---------------------------------------------------------------------------
 
 def predict_disease(image_bytes: bytes):
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    results = DETECTION_MODEL.predict(image, conf=CONFIDENCE_THRESHOLD, verbose=False)
+    with YOLO_LOCK:
+        results = DETECTION_MODEL.predict(image, conf=CONFIDENCE_THRESHOLD, verbose=False)
     result = results[0]
     boxes = result.boxes
 
@@ -373,7 +415,42 @@ def predict_disease(image_bytes: bytes):
     }
 
 
+# ---------------------------------------------------------------------------
+# Background job runner
+# ---------------------------------------------------------------------------
 
+def _run_diagnosis_job(job_id: str, image_bytes: bytes):
+    try:
+        prediction = predict_disease(image_bytes)
+
+        if prediction["recognized"] and prediction["status"] != "healthy":
+            llm_result = get_recommendation(
+                prediction["crop"], prediction["disease"],
+                prediction["confidence"], prediction["status"],
+            )
+            final = {**prediction, "RESULT": llm_result}
+        else:
+            final = prediction
+
+        with JOBS_LOCK:
+            JOBS[job_id] = {
+                "status": "done",
+                "result": final,
+                "created_at": JOBS[job_id]["created_at"],
+            }
+    except Exception as e:
+        print(f"[job {job_id}] failed: {e}")
+        with JOBS_LOCK:
+            JOBS[job_id] = {
+                "status": "error",
+                "error": str(e),
+                "created_at": JOBS[job_id]["created_at"],
+            }
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
 
 class DetectionRequest(BaseModel):
     crop: str
@@ -398,19 +475,28 @@ def recommend(req: DetectionRequest):
     return {"RESULT": get_recommendation(req.crop, req.disease, req.confidence, req.status)}
 
 
-@app.post("/diagnose")
-async def diagnose(file: UploadFile = File(...)):
+@app.post("/diagnose/start")
+async def diagnose_start(file: UploadFile = File(...)):
+    _prune_old_jobs()
     image_bytes = await file.read()
-    prediction = predict_disease(image_bytes)
 
-    if (not prediction["recognized"]) or (prediction["status"] == "healthy"):
-        return prediction
+    job_id = str(uuid.uuid4())
+    with JOBS_LOCK:
+        JOBS[job_id] = {"status": "pending", "created_at": time.time()}
 
-    llm_result = get_recommendation(
-        prediction["crop"], prediction["disease"], prediction["confidence"], prediction["status"]
-    )
+    thread = threading.Thread(target=_run_diagnosis_job, args=(job_id, image_bytes), daemon=True)
+    thread.start()
 
-    return {
-        **prediction,
-        "RESULT": llm_result,
-    }
+    return {"job_id": job_id}
+
+
+@app.get("/diagnose/status/{job_id}")
+def diagnose_status(job_id: str):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+
+    if job is None:
+        return {"status": "not_found"}
+
+    # Don't leak created_at to the client, it's internal bookkeeping
+    return {k: v for k, v in job.items() if k != "created_at"}
