@@ -41,7 +41,7 @@ llm = Llama(
     verbose=False,
 )
 
-DETECTION_MODEL = YOLO(r"C:\Users\user\Desktop\crop-predict\backend\best.pt")
+DETECTION_MODEL = YOLO(r"C:\Users\user\Desktop\crop-predict\backend\model.pt")
 CONFIDENCE_THRESHOLD = 0.5  # tune based on real-world behavior
 
 DOCS_FOLDER = r"C:\Users\user\Desktop\crop-predict\backend\CROP_DISEASES"
